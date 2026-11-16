@@ -177,7 +177,8 @@ impl PgConnectOptions {
     /// Android. It does not limit the duration of a query whose data has been
     /// acknowledged. By default, the operating system's settings are unchanged.
     /// Unsupported explicit requests fail the TCP connection attempt; Unix-domain
-    /// sockets are unchanged. A zero duration restores the system default.
+    /// sockets are unchanged. A zero duration restores the system default;
+    /// positive durations below one millisecond are rejected when connecting.
     pub fn tcp_user_timeout(mut self, timeout: Duration) -> Self {
         self.tcp_user_timeout = Some(timeout);
         self
