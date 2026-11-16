@@ -3,8 +3,10 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use bytes::BufMut;
+use cfg_if::cfg_if;
 
 pub use buffered::{BufferedSocket, WriteBuffer};
 
@@ -189,6 +191,20 @@ pub async fn connect_tcp<Ws: WithSocket>(
     port: u16,
     with_socket: Ws,
 ) -> crate::Result<Ws::Output> {
+    connect_tcp_with_options(host, port, None, None, with_socket).await
+}
+
+/// Connect with optional client-side TCP settings applied before `with_socket`,
+/// including any TLS upgrade it performs. Keepalive detects an idle dead peer;
+/// user timeout bounds unacknowledged data, not a query's running time.
+/// Unsupported explicitly requested settings fail the connection attempt.
+pub async fn connect_tcp_with_options<Ws: WithSocket>(
+    host: &str,
+    port: u16,
+    keepalive: Option<(Duration, Duration, u32)>,
+    user_timeout: Option<Duration>,
+    with_socket: Ws,
+) -> crate::Result<Ws::Output> {
     // IPv6 addresses in URLs will be wrapped in brackets and the `url` crate doesn't trim those.
     let host = host.trim_matches(&['[', ']'][..]);
 
@@ -198,6 +214,7 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
+        configure_tcp(socket2::SockRef::from(&stream), keepalive, user_timeout)?;
 
         return Ok(with_socket.with_socket(stream).await);
     }
@@ -216,6 +233,7 @@ pub async fn connect_tcp<Ws: WithSocket>(
                 .await
                 .and_then(|s| {
                     s.get_ref().set_nodelay(true)?;
+                    configure_tcp(socket2::SockRef::from(s.get_ref()), keepalive, user_timeout)?;
                     Ok(s)
                 });
             match stream {
@@ -238,7 +256,145 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
     #[cfg(not(feature = "_rt-async-std"))]
     {
-        crate::rt::missing_rt((host, port, with_socket))
+        crate::rt::missing_rt((host, port, keepalive, user_timeout, with_socket))
+    }
+}
+
+#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-std"))]
+fn configure_tcp(
+    socket: socket2::SockRef<'_>,
+    keepalive: Option<(Duration, Duration, u32)>,
+    user_timeout: Option<Duration>,
+) -> io::Result<()> {
+    if let Some((idle, interval, retries)) = keepalive {
+        socket.set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
+    }
+    if let Some(timeout) = user_timeout {
+        cfg_if! {
+            if #[cfg(any(target_os = "linux", target_os = "android"))] {
+                if !timeout.is_zero() && timeout.as_millis() == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TCP user timeout must be zero or at least one millisecond",
+                    ));
+                }
+                socket.set_tcp_user_timeout(Some(timeout))?;
+            } else {
+                let _ = timeout;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TCP user timeout is only supported on Linux and Android",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-std"))]
+fn tcp_keepalive(
+    idle: Duration,
+    interval: Duration,
+    retries: u32,
+) -> io::Result<socket2::TcpKeepalive> {
+    cfg_if! {
+        if #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "windows",
+            target_os = "cygwin",
+            all(target_os = "wasi", not(target_env = "p1")),
+        ))] {
+            Ok(socket2::TcpKeepalive::new()
+                .with_time(idle)
+                .with_interval(interval)
+                .with_retries(retries))
+        } else {
+            let _ = (idle, interval, retries);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TCP keepalive probe intervals and retries are not supported on this platform",
+            ))
+        }
+    }
+}
+
+#[cfg(all(test, feature = "_rt-tokio", target_os = "linux"))]
+mod tests {
+    use super::{connect_tcp, connect_tcp_with_options, Socket, WithSocket};
+    use std::time::Duration;
+
+    struct InspectTcp;
+
+    impl WithSocket for InspectTcp {
+        type Output = (bool, Duration, Duration, u32, Option<Duration>);
+
+        async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
+            let stream = (Box::new(socket) as Box<dyn std::any::Any + Send>)
+                .downcast::<tokio::net::TcpStream>()
+                .ok()
+                .expect("the Tokio connector hands its TCP socket to the TLS upgrade");
+            let socket = socket2::SockRef::from(stream.as_ref());
+            (
+                socket.keepalive().unwrap(),
+                socket.tcp_keepalive_time().unwrap(),
+                socket.tcp_keepalive_interval().unwrap(),
+                socket.tcp_keepalive_retries().unwrap(),
+                socket.tcp_user_timeout().unwrap(),
+            )
+        }
+    }
+
+    #[test]
+    fn tcp_keepalive_is_optional_and_set_before_the_socket_upgrade() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+
+                let default = connect_tcp("127.0.0.1", port, InspectTcp).await.unwrap();
+                assert!(!default.0);
+                assert_eq!(default.4, None);
+
+                let idle = Duration::from_secs(30);
+                let interval = Duration::from_secs(10);
+                let user_timeout = Duration::from_secs(60);
+                let configured = connect_tcp_with_options(
+                    "127.0.0.1",
+                    port,
+                    Some((idle, interval, 3)),
+                    Some(user_timeout),
+                    InspectTcp,
+                )
+                .await
+                .unwrap();
+                assert_eq!(configured, (true, idle, interval, 3, Some(user_timeout)));
+                assert!(matches!(
+                    connect_tcp_with_options(
+                        "127.0.0.1",
+                        port,
+                        None,
+                        Some(Duration::from_nanos(1)),
+                        InspectTcp,
+                    )
+                    .await,
+                    Err(crate::error::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::InvalidInput
+                ));
+            });
     }
 }
 
