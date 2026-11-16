@@ -1,10 +1,10 @@
 name: TCP keepalive
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/client-tcp-keepalive-20261116
-      - codex/client-tcp-keepalive-v086-20261116
+      - skardi/v0.8.6
+      - skardi/v0.9.0-rustls-flush
 
 permissions:
   contents: read

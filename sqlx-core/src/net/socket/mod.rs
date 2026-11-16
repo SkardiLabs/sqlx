@@ -231,6 +231,12 @@ fn configure_tcp(
     if let Some(timeout) = user_timeout {
         cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
+                if !timeout.is_zero() && timeout.as_millis() == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TCP user timeout must be zero or at least one millisecond",
+                    ));
+                }
                 socket.set_tcp_user_timeout(Some(timeout))?;
             } else {
                 let _ = timeout;
@@ -385,6 +391,18 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(configured, (true, idle, interval, 3, Some(user_timeout)));
+                assert!(matches!(
+                    connect_tcp_with_options(
+                        "127.0.0.1",
+                        port,
+                        None,
+                        Some(Duration::from_nanos(1)),
+                        InspectTcp,
+                    )
+                    .await,
+                    Err(crate::error::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::InvalidInput
+                ));
             });
     }
 }
