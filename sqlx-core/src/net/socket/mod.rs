@@ -191,29 +191,18 @@ pub async fn connect_tcp<Ws: WithSocket>(
     port: u16,
     with_socket: Ws,
 ) -> crate::Result<Ws::Output> {
-    connect_tcp_inner(host, port, None, with_socket).await
+    connect_tcp_with_options(host, port, None, None, with_socket).await
 }
 
-/// Connect with client-side TCP keepalive configured before the socket is
-/// handed to `with_socket`, including any TLS upgrade it performs.
-///
-/// These settings detect an unresponsive peer; they do not limit a query's
-/// running time. An unsupported setting fails the connection attempt.
-pub async fn connect_tcp_with_keepalive<Ws: WithSocket>(
-    host: &str,
-    port: u16,
-    idle: Duration,
-    interval: Duration,
-    retries: u32,
-    with_socket: Ws,
-) -> crate::Result<Ws::Output> {
-    connect_tcp_inner(host, port, Some((idle, interval, retries)), with_socket).await
-}
-
-async fn connect_tcp_inner<Ws: WithSocket>(
+/// Connect with optional client-side TCP settings applied before `with_socket`,
+/// including any TLS upgrade it performs. Keepalive detects an idle dead peer;
+/// user timeout bounds unacknowledged data, not a query's running time.
+/// Unsupported explicitly requested settings fail the connection attempt.
+pub async fn connect_tcp_with_options<Ws: WithSocket>(
     host: &str,
     port: u16,
     keepalive: Option<(Duration, Duration, u32)>,
+    user_timeout: Option<Duration>,
     with_socket: Ws,
 ) -> crate::Result<Ws::Output> {
     // IPv6 addresses in URLs will be wrapped in brackets and the `url` crate doesn't trim those.
@@ -225,10 +214,7 @@ async fn connect_tcp_inner<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
-        if let Some((idle, interval, retries)) = keepalive {
-            socket2::SockRef::from(&stream)
-                .set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
-        }
+        configure_tcp(socket2::SockRef::from(&stream), keepalive, user_timeout)?;
 
         return Ok(with_socket.with_socket(stream).await);
     }
@@ -247,10 +233,7 @@ async fn connect_tcp_inner<Ws: WithSocket>(
                 .await
                 .and_then(|s| {
                     s.get_ref().set_nodelay(true)?;
-                    if let Some((idle, interval, retries)) = keepalive {
-                        socket2::SockRef::from(s.get_ref())
-                            .set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
-                    }
+                    configure_tcp(socket2::SockRef::from(s.get_ref()), keepalive, user_timeout)?;
                     Ok(s)
                 });
             match stream {
@@ -273,8 +256,33 @@ async fn connect_tcp_inner<Ws: WithSocket>(
 
     #[cfg(not(feature = "_rt-async-std"))]
     {
-        crate::rt::missing_rt((host, port, keepalive, with_socket))
+        crate::rt::missing_rt((host, port, keepalive, user_timeout, with_socket))
     }
+}
+
+#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-std"))]
+fn configure_tcp(
+    socket: socket2::SockRef<'_>,
+    keepalive: Option<(Duration, Duration, u32)>,
+    user_timeout: Option<Duration>,
+) -> io::Result<()> {
+    if let Some((idle, interval, retries)) = keepalive {
+        socket.set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
+    }
+    if let Some(timeout) = user_timeout {
+        cfg_if! {
+            if #[cfg(any(target_os = "linux", target_os = "android"))] {
+                socket.set_tcp_user_timeout(Some(timeout))?;
+            } else {
+                let _ = timeout;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TCP user timeout is only supported on Linux and Android",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "_rt-tokio", feature = "_rt-async-std"))]
@@ -317,13 +325,13 @@ fn tcp_keepalive(
 
 #[cfg(all(test, feature = "_rt-tokio", target_os = "linux"))]
 mod tests {
-    use super::{connect_tcp, connect_tcp_with_keepalive, Socket, WithSocket};
+    use super::{connect_tcp, connect_tcp_with_options, Socket, WithSocket};
     use std::time::Duration;
 
     struct InspectTcp;
 
     impl WithSocket for InspectTcp {
-        type Output = (bool, Duration, Duration, u32);
+        type Output = (bool, Duration, Duration, u32, Option<Duration>);
 
         async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
             let stream = (Box::new(socket) as Box<dyn std::any::Any + Send>)
@@ -336,6 +344,7 @@ mod tests {
                 socket.tcp_keepalive_time().unwrap(),
                 socket.tcp_keepalive_interval().unwrap(),
                 socket.tcp_keepalive_retries().unwrap(),
+                socket.tcp_user_timeout().unwrap(),
             )
         }
     }
@@ -352,14 +361,21 @@ mod tests {
 
                 let default = connect_tcp("127.0.0.1", port, InspectTcp).await.unwrap();
                 assert!(!default.0);
+                assert_eq!(default.4, None);
 
                 let idle = Duration::from_secs(30);
                 let interval = Duration::from_secs(10);
-                let configured =
-                    connect_tcp_with_keepalive("127.0.0.1", port, idle, interval, 3, InspectTcp)
-                        .await
-                        .unwrap();
-                assert_eq!(configured, (true, idle, interval, 3));
+                let user_timeout = Duration::from_secs(60);
+                let configured = connect_tcp_with_options(
+                    "127.0.0.1",
+                    port,
+                    Some((idle, interval, 3)),
+                    Some(user_timeout),
+                    InspectTcp,
+                )
+                .await
+                .unwrap();
+                assert_eq!(configured, (true, idle, interval, 3, Some(user_timeout)));
             });
     }
 }

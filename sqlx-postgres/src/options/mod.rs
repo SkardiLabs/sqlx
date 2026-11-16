@@ -20,6 +20,7 @@ pub struct PgConnectOptions {
     pub(crate) port: u16,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) tcp_keepalive: Option<(Duration, Duration, u32)>,
+    pub(crate) tcp_user_timeout: Option<Duration>,
     pub(crate) username: String,
     pub(crate) password: Option<String>,
     pub(crate) database: Option<String>,
@@ -75,6 +76,7 @@ impl PgConnectOptions {
             host,
             socket: None,
             tcp_keepalive: None,
+            tcp_user_timeout: None,
             username,
             password: var("PGPASSWORD").ok(),
             database,
@@ -165,6 +167,19 @@ impl PgConnectOptions {
     /// ```
     pub fn tcp_keepalive(mut self, idle: Duration, interval: Duration, retries: u32) -> Self {
         self.tcp_keepalive = Some((idle, interval, retries));
+        self
+    }
+
+    /// Set how long transmitted data may remain unacknowledged, or buffered
+    /// data may remain unsent because of a zero-sized receive window.
+    ///
+    /// This configures client-side `TCP_USER_TIMEOUT` before TLS on Linux and
+    /// Android. It does not limit the duration of a query whose data has been
+    /// acknowledged. By default, the operating system's settings are unchanged.
+    /// Unsupported explicit requests fail the TCP connection attempt; Unix-domain
+    /// sockets are unchanged. A zero duration restores the system default.
+    pub fn tcp_user_timeout(mut self, timeout: Duration) -> Self {
+        self.tcp_user_timeout = Some(timeout);
         self
     }
 
