@@ -3,8 +3,10 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use bytes::BufMut;
+use cfg_if::cfg_if;
 
 pub use buffered::{BufferedSocket, WriteBuffer};
 
@@ -189,6 +191,31 @@ pub async fn connect_tcp<Ws: WithSocket>(
     port: u16,
     with_socket: Ws,
 ) -> crate::Result<Ws::Output> {
+    connect_tcp_inner(host, port, None, with_socket).await
+}
+
+/// Connect with client-side TCP keepalive configured before the socket is
+/// handed to `with_socket`, including any TLS upgrade it performs.
+///
+/// These settings detect an unresponsive peer; they do not limit a query's
+/// running time. An unsupported setting fails the connection attempt.
+pub async fn connect_tcp_with_keepalive<Ws: WithSocket>(
+    host: &str,
+    port: u16,
+    idle: Duration,
+    interval: Duration,
+    retries: u32,
+    with_socket: Ws,
+) -> crate::Result<Ws::Output> {
+    connect_tcp_inner(host, port, Some((idle, interval, retries)), with_socket).await
+}
+
+async fn connect_tcp_inner<Ws: WithSocket>(
+    host: &str,
+    port: u16,
+    keepalive: Option<(Duration, Duration, u32)>,
+    with_socket: Ws,
+) -> crate::Result<Ws::Output> {
     // IPv6 addresses in URLs will be wrapped in brackets and the `url` crate doesn't trim those.
     let host = host.trim_matches(&['[', ']'][..]);
 
@@ -198,6 +225,10 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
+        if let Some((idle, interval, retries)) = keepalive {
+            socket2::SockRef::from(&stream)
+                .set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
+        }
 
         return Ok(with_socket.with_socket(stream).await);
     }
@@ -216,6 +247,10 @@ pub async fn connect_tcp<Ws: WithSocket>(
                 .await
                 .and_then(|s| {
                     s.get_ref().set_nodelay(true)?;
+                    if let Some((idle, interval, retries)) = keepalive {
+                        socket2::SockRef::from(s.get_ref())
+                            .set_tcp_keepalive(&tcp_keepalive(idle, interval, retries)?)?;
+                    }
                     Ok(s)
                 });
             match stream {
@@ -238,7 +273,94 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
     #[cfg(not(feature = "_rt-async-std"))]
     {
-        crate::rt::missing_rt((host, port, with_socket))
+        crate::rt::missing_rt((host, port, keepalive, with_socket))
+    }
+}
+
+#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-std"))]
+fn tcp_keepalive(
+    idle: Duration,
+    interval: Duration,
+    retries: u32,
+) -> io::Result<socket2::TcpKeepalive> {
+    cfg_if! {
+        if #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "windows",
+            target_os = "cygwin",
+            all(target_os = "wasi", not(target_env = "p1")),
+        ))] {
+            Ok(socket2::TcpKeepalive::new()
+                .with_time(idle)
+                .with_interval(interval)
+                .with_retries(retries))
+        } else {
+            let _ = (idle, interval, retries);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TCP keepalive probe intervals and retries are not supported on this platform",
+            ))
+        }
+    }
+}
+
+#[cfg(all(test, feature = "_rt-tokio", target_os = "linux"))]
+mod tests {
+    use super::{connect_tcp, connect_tcp_with_keepalive, Socket, WithSocket};
+    use std::time::Duration;
+
+    struct InspectTcp;
+
+    impl WithSocket for InspectTcp {
+        type Output = (bool, Duration, Duration, u32);
+
+        async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
+            let stream = (Box::new(socket) as Box<dyn std::any::Any + Send>)
+                .downcast::<tokio::net::TcpStream>()
+                .ok()
+                .expect("the Tokio connector hands its TCP socket to the TLS upgrade");
+            let socket = socket2::SockRef::from(stream.as_ref());
+            (
+                socket.keepalive().unwrap(),
+                socket.tcp_keepalive_time().unwrap(),
+                socket.tcp_keepalive_interval().unwrap(),
+                socket.tcp_keepalive_retries().unwrap(),
+            )
+        }
+    }
+
+    #[test]
+    fn tcp_keepalive_is_optional_and_set_before_the_socket_upgrade() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+
+                let default = connect_tcp("127.0.0.1", port, InspectTcp).await.unwrap();
+                assert!(!default.0);
+
+                let idle = Duration::from_secs(30);
+                let interval = Duration::from_secs(10);
+                let configured =
+                    connect_tcp_with_keepalive("127.0.0.1", port, idle, interval, 3, InspectTcp)
+                        .await
+                        .unwrap();
+                assert_eq!(configured, (true, idle, interval, 3));
+            });
     }
 }
 

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::env::var;
 use std::fmt::{Display, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use ssl_mode::PgSslMode;
 
@@ -18,6 +19,7 @@ pub struct PgConnectOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) socket: Option<PathBuf>,
+    pub(crate) tcp_keepalive: Option<(Duration, Duration, u32)>,
     pub(crate) username: String,
     pub(crate) password: Option<String>,
     pub(crate) database: Option<String>,
@@ -72,6 +74,7 @@ impl PgConnectOptions {
             port,
             host,
             socket: None,
+            tcp_keepalive: None,
             username,
             password: var("PGPASSWORD").ok(),
             database,
@@ -140,6 +143,28 @@ impl PgConnectOptions {
     /// ```
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Enable client-side TCP keepalive probes with the given idle time,
+    /// probe interval, and maximum number of unanswered probes.
+    ///
+    /// By default, SQLx does not change the operating system's keepalive
+    /// settings. These settings are applied before TLS and do not impose a
+    /// maximum query duration. They are ignored for Unix-domain sockets;
+    /// unsupported TCP settings fail the connection attempt.
+    ///
+    /// ```rust
+    /// # use sqlx_postgres::PgConnectOptions;
+    /// # use std::time::Duration;
+    /// let options = PgConnectOptions::new().tcp_keepalive(
+    ///     Duration::from_secs(30),
+    ///     Duration::from_secs(10),
+    ///     3,
+    /// );
+    /// ```
+    pub fn tcp_keepalive(mut self, idle: Duration, interval: Duration, retries: u32) -> Self {
+        self.tcp_keepalive = Some((idle, interval, retries));
         self
     }
 
