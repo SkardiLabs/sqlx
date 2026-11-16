@@ -21,11 +21,11 @@ json = ["serde", "serde_json"]
 
 # for conditional compilation
 _rt-async-global-executor = ["async-global-executor", "_rt-async-io", "_rt-async-task"]
-_rt-async-io = ["async-io", "async-fs"] # see note at async-fs declaration
+_rt-async-io = ["async-io", "async-fs", "dep:socket2"] # see note at async-fs declaration
 _rt-async-std = ["async-std", "_rt-async-io"]
 _rt-async-task = ["async-task"]
 _rt-smol = ["smol", "_rt-async-io", "_rt-async-task"]
-_rt-tokio = ["tokio", "tokio-stream"]
+_rt-tokio = ["tokio", "tokio-stream", "dep:socket2"]
 
 _tls-native-tls = ["native-tls"]
 _tls-rustls-aws-lc-rs = ["_tls-rustls", "rustls/aws-lc-rs", "webpki-roots"]
@@ -104,6 +104,9 @@ event-listener = "5.2.0"
 hashbrown = "0.16.0"
 
 thiserror.workspace = true
+
+[target.'cfg(any(not(target_family = "wasm"), all(target_os = "wasi", not(target_env = "p1"))))'.dependencies]
+socket2 = { version = "0.6.3", features = ["all"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.25.0", features = ["rt"] }

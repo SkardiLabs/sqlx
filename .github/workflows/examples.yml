@@ -2,6 +2,9 @@ name: Examples
 
 on:
   pull_request:
+    branches-ignore:
+      - skardi/v0.8.6
+      - skardi/v0.9.0-rustls-flush
   push:
     branches:
       - main

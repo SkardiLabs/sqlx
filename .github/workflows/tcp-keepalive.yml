@@ -1,0 +1,32 @@
+name: TCP keepalive
+
+on:
+  pull_request:
+    branches:
+      - skardi/v0.8.6
+      - skardi/v0.9.0-rustls-flush
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tcp-keepalive-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  socket:
+    name: Client socket options and Postgres API
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.96.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Check real socket behavior
+        run: >-
+          cargo +1.96.1 test -p sqlx-core --all-features --lib
+          net::socket::tests::tcp_keepalive_is_optional_and_set_before_the_socket_upgrade
+          -- --exact
+      - name: Check the Postgres API
+        run: cargo +1.96.1 check -p sqlx-postgres --all-features
